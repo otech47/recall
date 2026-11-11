@@ -1,4 +1,4 @@
-//! recall: deterministic index and search over Claude Code, Codex, Kimi Code and Cursor transcripts.
+//! recall: deterministic index and search over Claude Code, Codex and Kimi Code transcripts.
 //! One binary: deterministic ranking by default, an optional model pick behind `recall agent`.
 
 use memmap2::Mmap;
@@ -382,7 +382,6 @@ fn resume_cmd(harness: &str, sid: &str, cwd: &str) -> String {
         "claude" => format!("claude --resume {sid}"),
         "codex" => format!("codex resume {sid}"),
         "kimi" => format!("kimi --session {sid}"),
-        "cursor" => format!("agent --resume {sid}"),
         _ => return String::new(),
     };
     match dev_shell(cwd) {
@@ -748,55 +747,6 @@ fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
     memchr::memmem::rfind(hay, needle)
 }
 
-fn parse_cursor(meta_path: &Path) -> Option<Session> {
-    let d = meta_path.parent()?;
-    let meta: Value = serde_json::from_slice(&fs::read(meta_path).ok()?).ok()?;
-    let mut s = Session::new(
-        "cursor",
-        d.file_name()?.to_string_lossy().into_owned(),
-        meta_path,
-    );
-    s.cwd = meta
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    s.title = meta
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    s.started = iso_from_ms(meta.get("createdAtMs").and_then(Value::as_i64).unwrap_or(0));
-    s.ended = iso_from_ms(meta.get("updatedAtMs").and_then(Value::as_i64).unwrap_or(0));
-    let ph = d.join("prompt_history.json");
-    if ph.exists() {
-        if let Ok(hist) = serde_json::from_slice::<Value>(&fs::read(&ph).unwrap_or_default()) {
-            if let Some(a) = hist.as_array() {
-                for p in a.iter().rev() {
-                    if let Some(t) = p.as_str() {
-                        s.add_prompt(t);
-                    }
-                }
-            }
-        }
-        let (mt, sz) = stat(&ph);
-        s.mtime = s.mtime.max(mt);
-        s.size += sz;
-    }
-    let log = home()
-        .join(".cursor")
-        .join("sessions")
-        .join(format!("{}.jsonl", s.id));
-    if log.exists() {
-        let _ = for_each_line(&log, |raw| {
-            if find_in(raw, b"\"event\":\"preToolUse\"", 60).is_some() {
-                s.add_paths(raw);
-            }
-        });
-    }
-    Some(s)
-}
-
 // ---------------------------------------------------------------- index
 
 fn list_dir(p: &Path) -> Vec<PathBuf> {
@@ -845,13 +795,6 @@ fn discover() -> Vec<(&'static str, PathBuf)> {
             }
         }
     }
-    for ws in list_dir(&h.join(".cursor").join("chats")) {
-        for chat in list_dir(&ws) {
-            if chat.join("meta.json").is_file() {
-                out.push(("cursor", chat.join("meta.json")));
-            }
-        }
-    }
     out
 }
 
@@ -871,16 +814,6 @@ fn fingerprint(harness: &str, p: &Path) -> (String, f64, u64) {
             } else {
                 (p.to_string_lossy().into_owned(), mt, size)
             }
-        }
-        "cursor" => {
-            let ph = p.parent().unwrap().join("prompt_history.json");
-            let (mut mt, mut size) = (mt, size);
-            if ph.exists() {
-                let (m2, s2) = stat(&ph);
-                size += s2;
-                mt = mt.max(m2);
-            }
-            (p.to_string_lossy().into_owned(), mt, size)
         }
         _ => (p.to_string_lossy().into_owned(), mt, size),
     }
@@ -947,8 +880,7 @@ fn build_index(full: bool, verbose: bool) -> Vec<Value> {
             let s = match *harness {
                 "claude" => parse_claude(p).ok(),
                 "codex" => parse_codex(p, &titles).ok().flatten(),
-                "kimi" => parse_kimi(p),
-                _ => parse_cursor(p),
+                _ => parse_kimi(p),
             };
             s.map(|mut s| {
                 s.mtime = mt;
@@ -1411,7 +1343,7 @@ fn cmd_show(recs: &[Value], prefix: &str, as_json: bool) {
 
 // ---------------------------------------------------------------- cli
 
-const USAGE: &str = r#"recall: describe a past coding-agent session in your own words and get its id and resume command. Reads every Claude Code, Codex, Kimi Code and Cursor transcript on this machine.
+const USAGE: &str = r#"recall: describe a past coding-agent session in your own words and get its id and resume command. Reads every Claude Code, Codex and Kimi Code transcript on this machine.
 
 usage
   recall "<what you remember>"          find an exact session ID, or rank sessions by how well their prompts, title, project and touched files match your words. No model call. In a terminal it shows the top three and waits for a key. Piped or with -j it prints the top ten and the resume command of the first.
@@ -1431,10 +1363,10 @@ keys, in a terminal
 
 options
   -r, --resume            run the resume command of the first result instead of waiting for a key
-  -a, --agent <name>      who answers in agent search: claude (default), codex, kimi, cursor, local. Codex, kimi and cursor take 25 to 40 seconds to start in print mode. local is the ollama server on this machine. Deep search always runs on claude.
+  -a, --agent <name>      who answers in agent search: claude (default), codex, kimi, local. Codex and kimi take 25 to 40 seconds to start in print mode. local is the ollama server on this machine. Deep search always runs on claude.
   -m, --model <name>      model for agent search, passed through as is. Default sonnet for claude (haiku is correct too but 3x slower here), qwen3.8:27b-mlx for local, the agent's own default otherwise. With recall deep, the model for deep search.
   -n, --limit <n>         how many results to print (default 3 in a terminal, 10 when piped or with -j). Agent search always reads at least ten candidates.
-  -f, --from <harness>    only claude, codex, kimi or cursor sessions
+  -f, --from <harness>    only claude, codex or kimi sessions
   -p, --project <text>    only sessions whose project directory or path contains this, case-insensitive
   -s, --since <date>      only sessions that ended on or after YYYY-MM-DD. Without it, phrases like "yesterday", "last week", "a few weeks ago", "last month" set a wide window on their own.
   -u, --until <date>      only sessions that started on or before YYYY-MM-DD
@@ -1453,7 +1385,7 @@ environment
   RECALL_DEEP_MODEL  default model for deep search (opus)
 
 examples
-  recall "the one where I ported my claude skills and hooks to codex, then kimi, then cursor"
+  recall "the one where I ported my claude skills and hooks to codex, then kimi"
   recall -r "yesterday's kimi session about the tycho dashboard being slow"
   recall agent "the fedi e2e run that kept timing out"
   recall agent -a codex -m gpt-5 "review of the miniapp api debugger"
@@ -1465,8 +1397,7 @@ examples
 what gets indexed
   Claude Code   ~/.claude/projects/<slug>/<id>.jsonl, subagent agent-*.jsonl files skipped
   Codex         ~/.codex/sessions/Y/M/D/rollout-*.jsonl, only threads a user started, names from session_index.jsonl
-  Kimi Code     ~/.kimi-code/sessions/wd_*/session_*/agents/main/wire.jsonl plus state.json
-  Cursor        ~/.cursor/chats/<workspace>/<id>/meta.json and prompt_history.json, tool paths from ~/.cursor/sessions/<id>.jsonl"#;
+  Kimi Code     ~/.kimi-code/sessions/wd_*/session_*/agents/main/wire.jsonl plus state.json"#;
 
 const COMMANDS: &[&str] = &[
     "agent", "deep", "search", "index", "grep", "show", "resume", "stats",
@@ -1543,6 +1474,19 @@ fn parse_args() -> Args {
             }
         }
         i += 1;
+    }
+    if let Some(h) = &a.harness {
+        if !matches!(h.as_str(), "claude" | "codex" | "kimi") {
+            eprintln!("unknown harness {h}: use claude, codex or kimi");
+            std::process::exit(2);
+        }
+    }
+    if !matches!(a.agent.as_str(), "claude" | "codex" | "kimi" | "local") {
+        eprintln!(
+            "unknown agent {}: use claude, codex, kimi or local",
+            a.agent
+        );
+        std::process::exit(2);
     }
     if positional.is_empty() {
         println!("{USAGE}");
@@ -1721,15 +1665,6 @@ fn ask(agent: &str, model: Option<&str>, prompt: &str) -> Result<String, String>
             }
             run_capture(&mut c)
         }
-        "cursor" => {
-            let mut c = Command::new("agent");
-            c.args(["-p", "--trust", "--output-format", "text"]);
-            if let Some(m) = model {
-                c.args(["--model", m]);
-            }
-            c.arg(prompt);
-            run_capture(&mut c)
-        }
         "local" => {
             let body = json!({"model": model.unwrap_or("qwen3.8:27b-mlx"), "prompt": prompt, "stream": false, "format": "json", "think": false}).to_string();
             let raw = run_capture(Command::new("curl").args([
@@ -1746,7 +1681,7 @@ fn ask(agent: &str, model: Option<&str>, prompt: &str) -> Result<String, String>
             Ok(s(&v, "response"))
         }
         other => Err(format!(
-            "unknown agent {other}: use claude, codex, kimi, cursor or local"
+            "unknown agent {other}: use claude, codex, kimi or local"
         )),
     }
 }
@@ -1998,7 +1933,6 @@ Transcripts are read in place:
 - Claude Code: ~/.claude/projects/<slug>/<id>.jsonl
 - Codex: ~/.codex/sessions/Y/M/D/rollout-*-<id>.jsonl
 - Kimi Code: ~/.kimi-code/sessions/wd_*/session_<id>/agents/main/wire.jsonl
-- Cursor: ~/.cursor/chats/<workspace>/<id>/ and ~/.cursor/sessions/<id>.jsonl
 A transcript can be tens of megabytes. Search it, never read it whole.
 
 Commands you can run:

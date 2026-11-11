@@ -1,6 +1,6 @@
 # recall, for coding agents
 
-recall finds a past coding-agent session on this machine from a description and prints its id and resume command. It reads Claude Code, Codex, Kimi Code and Cursor transcripts in place. One Rust binary, no runtime dependencies.
+recall finds a past coding-agent session on this machine from a description and prints its id and resume command. It reads Claude Code, Codex and Kimi Code transcripts in place. One Rust binary, no runtime dependencies.
 
 ## Install
 
@@ -29,7 +29,7 @@ Read the prompt lists, not the titles. A title comes from the first prompt and o
 Narrow when the user gives you a handle:
 
 ```
--f claude|codex|kimi|cursor     one harness
+-f claude|codex|kimi             one harness
 -p <text>                        project directory or path substring
 -s YYYY-MM-DD   -u YYYY-MM-DD    date window
 -n <count>                       more or fewer hits

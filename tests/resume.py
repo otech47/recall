@@ -65,8 +65,7 @@ print(json.dumps({'argv': [os.path.basename(sys.argv[0]), *sys.argv[1:]],
         root = self.workspace()
         for harness, args in [('claude', ['claude', '--resume']),
                               ('codex', ['codex', 'resume']),
-                              ('kimi', ['kimi', '--session']),
-                              ('cursor', ['agent', '--resume'])]:
+                              ('kimi', ['kimi', '--session'])]:
             with self.subTest(harness=harness):
                 self.session(root, harness)
                 result = self.resumed()

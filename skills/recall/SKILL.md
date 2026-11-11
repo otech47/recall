@@ -1,7 +1,7 @@
 ---
 name: recall
 description: >-
-  Find a past coding-agent session (Claude Code, Codex, Kimi Code, Cursor) from a description and print its id and resume command. Triggers on: "find the session where", "which session did I", "resume the one about", "that conversation from last week", "where did I do X before". Installs recall from github.com/otech47/recall if it is missing.
+  Find a past coding-agent session (Claude Code, Codex, Kimi Code) from a description and print its id and resume command. Triggers on: "find the session where", "which session did I", "resume the one about", "that conversation from last week", "where did I do X before". Installs recall from github.com/otech47/recall if it is missing.
 ---
 
 # recall

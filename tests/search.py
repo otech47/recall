@@ -32,11 +32,10 @@ class SearchTest(unittest.TestCase):
         records = [self.record('different-session', first='Find ' + sid), self.record(sid)]
         self.assertEqual([row['id'] for row in self.search(records, sid)], [sid])
 
-    def test_all_four_agent_ids_support_case_and_whitespace(self):
+    def test_all_three_agent_ids_support_case_and_whitespace(self):
         for agent, sid in [('claude', 'd45f57a0-098c-48a9-9058-c0d2d7af35da'),
                            ('codex', '01a0f1d5-3998-7c62-9bee-26921cfd4466'),
-                           ('kimi', 'session_09815094-faa0-456d-bfe9-9f2e299563d1'),
-                           ('cursor', 'bb93d387-d309-439b-a24b-b381625bd1ed')]:
+                           ('kimi', 'session_09815094-faa0-456d-bfe9-9f2e299563d1')]:
             with self.subTest(agent=agent):
                 records = [self.record(sid, harness=agent)]
                 self.assertEqual(self.search(records, ' ' + sid.upper() + ' ')[0]['id'], sid)

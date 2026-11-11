@@ -1,16 +1,16 @@
 # recall
 
-Describe a past coding-agent session from memory and get back its id and the command that reopens it. Works across Claude Code, Codex, Kimi Code and Cursor.
+Describe a past coding-agent session from memory and get back its id and the command that reopens it. Works across Claude Code, Codex and Kimi Code.
 
 ```
-recall "the one where I made my claude skills and hooks work in codex, then kimi, then cursor"
+recall "the one where I made my claude skills and hooks work in codex, then kimi"
 ```
 
 ```
  1. 188.26  claude 2026-09-10  tools   a122183c-3aed-48c9-a384-c57502e60429
       Open source LLM subscriptions comparison
       > So, I want to try out a new LLM subscription using the open source models...
-      terms: agent claude codex cursor harness hook kimi skill   turns: 13
+      terms: agent claude codex harness hook kimi skill   turns: 13
  2. ...
  3. ...
 
@@ -69,7 +69,7 @@ A full session ID selects that session before text ranking. Search filters and e
 | option | what it does |
 |---|---|
 | `-r`, `--resume` | reopen the first result instead of waiting for a key |
-| `-a`, `--agent` | who ranks in agent search: `claude`, `codex`, `kimi`, `cursor`, `local` (ollama). Deep search always runs on claude |
+| `-a`, `--agent` | who ranks in agent search: `claude`, `codex`, `kimi`, `local` (ollama). Deep search always runs on claude |
 | `-m`, `--model` | model for agent search, or for deep search with `recall deep`, passed through as is |
 | `-n`, `--limit` | how many results to print. 3 in a terminal, 10 when piped or with `-j` |
 | `-f`, `--from` | only sessions from one harness |
@@ -113,7 +113,6 @@ python3 tests/search.py
 | Claude Code | `~/.claude/projects/<slug>/<id>.jsonl`, subagent `agent-*.jsonl` files skipped | `claude --resume <id>` |
 | Codex | `~/.codex/sessions/Y/M/D/rollout-*.jsonl`, only threads a user started, names from `session_index.jsonl` | `codex resume <id>` |
 | Kimi Code | `~/.kimi-code/sessions/wd_*/session_*/agents/main/wire.jsonl` plus `state.json` | `kimi --session <id>` |
-| Cursor | `~/.cursor/chats/<workspace>/<id>/meta.json` and `prompt_history.json`, tool paths from `~/.cursor/sessions/<id>.jsonl` | `agent --resume <id>` |
 
 Sessions in a workspace with `flake.nix` resume through `nix develop`, including sessions started in subdirectories. Fedi worktrees use the `worktree` shell.
 
@@ -131,6 +130,6 @@ Terms are lowercased, stopwords dropped, and stemmed with Porter steps 1a and 1b
 <details>
 <summary>why the model call is optional, and when you want it</summary>
 
-The ranking alone usually puts the right session in the top two. What it cannot do is tell a session that turned into the thing you describe apart from one whose title names it, because titles come from first prompts. `recall agent` fixes that with one call: the model gets the top ten candidates with up to twelve prompts each, about 4500 tokens, and is told the rank is a strong prior. Sonnet answers in a few seconds. Codex, Kimi and Cursor work too but take longer to start in print mode.
+The ranking alone usually puts the right session in the top two. What it cannot do is tell a session that turned into the thing you describe apart from one whose title names it, because titles come from first prompts. `recall agent` fixes that with one call: the model gets the top ten candidates with up to twelve prompts each, about 4500 tokens, and is told the rank is a strong prior. Sonnet answers in a few seconds. Codex and Kimi work too but take longer to start in print mode.
 
 </details>
