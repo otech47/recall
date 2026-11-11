@@ -31,7 +31,7 @@ recall "<the user's description, verbatim>" -x <your own session id> -j
 - Narrow with `-f <harness>`, `-p <project>`, `-s <since>`, `-u <until>`, `-n <count>` when the user gives you a handle.
 - `recall show <id>` prints one session in full. `recall grep '<regex>'` scans the raw transcripts when the words come from agent output rather than user prompts.
 
-Do not use `recall agent`. That mode spends a model call on the pick for a human at the terminal. You are the model here.
+Do not use `recall agent` or `recall deep`. They spend model calls for a human at the terminal. You are the model here.
 
 ## Answer
 

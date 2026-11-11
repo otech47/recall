@@ -106,6 +106,10 @@ fn token_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"[a-z0-9]+").unwrap())
 }
+fn url_host_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"https?://(?:www\.)?[^/\s]+").unwrap())
+}
 
 /// Porter step 1a and 1b, nothing else: enough to fold plurals and -ed/-ing, never shorter than 4 chars.
 fn stem(w: &str) -> String {
@@ -135,6 +139,7 @@ fn stem(w: &str) -> String {
 
 fn tokens(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
+    let lower = url_host_re().replace_all(&lower, " ");
     let stop = stop_words();
     token_re()
         .find_iter(&lower)
@@ -355,18 +360,34 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+fn dev_shell(cwd: &str) -> Option<String> {
+    let dir = fs::canonicalize(cwd).ok()?;
+    let root = dir.ancestors().find(|p| p.join("flake.nix").is_file())?;
+    let shell = if root.join(".git").is_file() && root.join("dev/worktree-cache.py").is_file() {
+        "#worktree"
+    } else {
+        ""
+    };
+    Some(format!("{}{shell}", root.display()))
+}
+
 fn resume_cmd(harness: &str, sid: &str, cwd: &str) -> String {
     let cd = if cwd.is_empty() {
         String::new()
     } else {
         format!("cd {} && ", shell_quote(cwd))
     };
-    match harness {
-        "claude" => format!("{cd}claude --resume {sid}"),
-        "codex" => format!("{cd}codex resume {sid}"),
-        "kimi" => format!("{cd}kimi --session {sid}"),
-        "cursor" => format!("{cd}agent --resume {sid}"),
-        _ => String::new(),
+    let sid = shell_quote(sid);
+    let cmd = match harness {
+        "claude" => format!("claude --resume {sid}"),
+        "codex" => format!("codex resume {sid}"),
+        "kimi" => format!("kimi --session {sid}"),
+        "cursor" => format!("agent --resume {sid}"),
+        _ => return String::new(),
+    };
+    match dev_shell(cwd) {
+        Some(flake) => format!("{cd}env -u CARGO_BUILD_TARGET_DIR -u CARGO_TARGET_DIR -u TS_RS_EXPORT_DIR -u REPO_ROOT nix develop {} -c {cmd}", shell_quote(&flake)),
+        None => format!("{cd}{cmd}"),
     }
 }
 
@@ -869,7 +890,8 @@ fn load_index() -> Vec<Value> {
     let mut recs = vec![];
     if let Ok(f) = fs::File::open(index_file()) {
         for line in BufReader::new(f).lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if let Ok(mut v) = serde_json::from_str::<Value>(&line) {
+                v["resume"] = json!(resume_cmd(&s(&v, "harness"), &s(&v, "id"), &s(&v, "cwd")));
                 recs.push(v);
             }
         }
@@ -1025,7 +1047,7 @@ struct Args {
     project: Option<String>,
     since: Option<String>,
     until: Option<String>,
-    limit: usize,
+    limit: Option<usize>,
     json: bool,
     all: bool,
     full: bool,
@@ -1034,6 +1056,7 @@ struct Args {
     exclude: Vec<String>,
     agent: String,
     model: Option<String>,
+    model_flag: bool,
     resume: bool,
 }
 
@@ -1067,14 +1090,8 @@ fn filter_recs<'a>(recs: &'a [Value], a: &Args) -> Vec<&'a Value> {
                     return false;
                 }
             }
-            if !a.all {
-                let k = s(r, "kind");
-                if k != "user" && k != "archived" {
-                    return false;
-                }
-                if r.get("turns").and_then(Value::as_u64).unwrap_or(0) == 0 {
-                    return false;
-                }
+            if !a.all && r.get("turns").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                return false;
             }
             true
         })
@@ -1097,7 +1114,16 @@ fn age_days(r: &Value) -> f64 {
 
 type Hit<'a> = (f64, Vec<String>, &'a Value);
 
-fn search<'a>(recs: &[&'a Value], query: &str, a: &Args) -> Vec<Hit<'a>> {
+fn search<'a>(recs: &[&'a Value], query: &str, limit: usize) -> Vec<Hit<'a>> {
+    let exact: Vec<Hit> = recs
+        .iter()
+        .filter(|r| s(r, "id").eq_ignore_ascii_case(query.trim()))
+        .take(limit)
+        .map(|r| (1.0, vec!["session id".to_string()], *r))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
     let q = tokens(query);
     if q.is_empty() {
         return vec![];
@@ -1130,8 +1156,15 @@ fn search<'a>(recs: &[&'a Value], query: &str, a: &Args) -> Vec<Hit<'a>> {
     }
     let idf: HashMap<&str, f64> = qset
         .iter()
-        .map(|t| (t.as_str(), (1.0 + n / (1.0 + df[t.as_str()] as f64)).ln()))
+        .map(|t| {
+            let d = df[t.as_str()] as f64;
+            (
+                t.as_str(),
+                ((n - d + 0.5) / (d + 0.5)).ln().max(0.01).powi(2),
+            )
+        })
         .collect();
+    let idf_total: f64 = idf.values().sum();
     let mut results: Vec<Hit> = vec![];
     for (r, counts) in recs.iter().zip(per_doc.iter()) {
         if counts.is_empty() {
@@ -1143,7 +1176,7 @@ fn search<'a>(recs: &[&'a Value], query: &str, a: &Args) -> Vec<Hit<'a>> {
             score += idf[t.as_str()] * field_weight(fname) * (*c as f64).ln_1p();
             matched.insert(t.clone());
         }
-        let cov = matched.len() as f64 / qset.len() as f64;
+        let cov = matched.iter().map(|t| idf[t.as_str()]).sum::<f64>() / idf_total;
         score *= 0.5 + cov;
         score *= 1.0 + 0.15 * (-age_days(r) / 90.0).exp();
         let mut m: Vec<String> = matched.into_iter().collect();
@@ -1155,11 +1188,11 @@ fn search<'a>(recs: &[&'a Value], query: &str, a: &Args) -> Vec<Hit<'a>> {
             .unwrap()
             .then_with(|| s(x.2, "ended").cmp(&s(y.2, "ended")))
     });
-    results.truncate(a.limit);
+    results.truncate(limit);
     results
 }
 
-fn grep_sessions<'a>(recs: &[&'a Value], pattern: &str, a: &Args) -> Vec<Hit<'a>> {
+fn grep_sessions<'a>(recs: &[&'a Value], pattern: &str, limit: usize) -> Vec<Hit<'a>> {
     let rx = match regex::bytes::RegexBuilder::new(pattern)
         .case_insensitive(true)
         .build()
@@ -1198,7 +1231,7 @@ fn grep_sessions<'a>(recs: &[&'a Value], pattern: &str, a: &Args) -> Vec<Hit<'a>
             .unwrap()
             .then_with(|| s(x.2, "ended").cmp(&s(y.2, "ended")))
     });
-    results.truncate(a.limit);
+    results.truncate(limit);
     results
 }
 
@@ -1251,7 +1284,7 @@ fn hit_json(score: f64, matched: &[String], r: &Value) -> Value {
     Value::Object(d)
 }
 
-fn print_results(results: &[Hit], as_json: bool) {
+fn print_results(results: &[Hit], as_json: bool, resume_line: bool) {
     if as_json {
         let out: Vec<Value> = results
             .iter()
@@ -1293,8 +1326,10 @@ fn print_results(results: &[Hit], as_json: bool) {
             );
         }
     }
-    println!();
-    println!("resume: {}", s(results[0].2, "resume"));
+    if resume_line {
+        println!();
+        println!("resume: {}", s(results[0].2, "resume"));
+    }
 }
 
 fn find_one<'a>(recs: &'a [Value], prefix: &str) -> &'a Value {
@@ -1379,26 +1414,33 @@ fn cmd_show(recs: &[Value], prefix: &str, as_json: bool) {
 const USAGE: &str = r#"recall: describe a past coding-agent session in your own words and get its id and resume command. Reads every Claude Code, Codex, Kimi Code and Cursor transcript on this machine.
 
 usage
-  recall "<what you remember>"          rank every session by how well its prompts, title, project and touched files match your words. No model call. Prints the top ten and the resume command of the first.
-  recall agent "<what you remember>"    same ranking, then one model call reads the top ten prompt lists and picks. Claude sonnet by default, 3 to 10 seconds.
+  recall "<what you remember>"          find an exact session ID, or rank sessions by how well their prompts, title, project and touched files match your words. No model call. In a terminal it shows the top three and waits for a key. Piped or with -j it prints the top ten and the resume command of the first.
+  recall agent "<what you remember>"    same ranking, then one model call reads the top ten prompt lists and ranks up to three. Claude sonnet by default, 3 to 10 seconds.
+  recall deep "<what you remember>"     claude searches the raw transcripts itself, agent replies and tool output included, and checks each answer before it returns up to three. Opus by default, usually under a minute.
   recall show <id>                      one session in full: metadata, every user prompt, touched paths, transcript file, resume command. Any unambiguous prefix or suffix of the id works.
   recall resume <id>                    print just the resume command
   recall grep <regex>                   scan the raw transcripts for a regex (case-insensitive) and rank sessions by hit count. Slower, but sees assistant output and tool results too.
   recall index                          refresh the index. Incremental: only transcripts whose mtime or size changed are reparsed. Every other command refreshes first.
   recall stats                          sessions per harness and where the index lives
 
+keys, in a terminal
+  1-3   resume that session here. It changes to the session's directory and reopens it.
+  a     agent search on the same words, after a plain search
+  d     deep search on the same words, after a plain or agent search. It is told which sessions you already saw.
+  q     quit. Enter and Esc quit too.
+
 options
-  -r, --resume            run the resume command of the pick (or of the first hit) instead of only printing it
-  -a, --agent <name>      who answers in agent mode: claude (default), codex, kimi, cursor, local. Codex, kimi and cursor take 25 to 40 seconds to start in print mode. local is the ollama server on this machine.
-  -m, --model <name>      model for that agent, passed through as is. Default sonnet for claude (haiku is correct too but 3x slower here), qwen3.8:27b-mlx for local, the agent's own default otherwise.
-  -n, --limit <n>         how many hits to print, or how many candidates the model sees (default 10)
+  -r, --resume            run the resume command of the first result instead of waiting for a key
+  -a, --agent <name>      who answers in agent search: claude (default), codex, kimi, cursor, local. Codex, kimi and cursor take 25 to 40 seconds to start in print mode. local is the ollama server on this machine. Deep search always runs on claude.
+  -m, --model <name>      model for agent search, passed through as is. Default sonnet for claude (haiku is correct too but 3x slower here), qwen3.8:27b-mlx for local, the agent's own default otherwise. With recall deep, the model for deep search.
+  -n, --limit <n>         how many results to print (default 3 in a terminal, 10 when piped or with -j). Agent search always reads at least ten candidates.
   -f, --from <harness>    only claude, codex, kimi or cursor sessions
   -p, --project <text>    only sessions whose project directory or path contains this, case-insensitive
   -s, --since <date>      only sessions that ended on or after YYYY-MM-DD. Without it, phrases like "yesterday", "last week", "a few weeks ago", "last month" set a wide window on their own.
   -u, --until <date>      only sessions that started on or before YYYY-MM-DD
   -x, --exclude <id>      drop sessions whose id starts with this. Repeatable. An agent should pass its own session id, since the session asking always matches itself.
-  -j, --json              machine output. One object per hit with id, harness, project, dates, title, score, matched terms, first prompt, summary and up to 15 prompts. For show, the whole record. For agent, the pick.
-  -A, --all               include background sessions and sessions with no user prompt
+  -j, --json              machine output. One object per hit with id, harness, project, dates, title, score, matched terms, first prompt, summary and up to 15 prompts. For show, the whole record. For agent and deep, the picks.
+  -A, --all               include sessions with no user prompt
   -F, --full              index: ignore the cache and reparse every transcript
   -N, --no-refresh        use the index as it is on disk, skip the refresh
   -T, --threads <n>       worker threads for indexing and grep (default: all cores)
@@ -1407,13 +1449,15 @@ options
 environment
   RECALL_INDEX_DIR   where the index lives (default ~/.agents/recall)
   RECALL_AGENT       default for --agent
-  RECALL_MODEL       default for --model
+  RECALL_MODEL       default for --model in agent search
+  RECALL_DEEP_MODEL  default model for deep search (opus)
 
 examples
   recall "the one where I ported my claude skills and hooks to codex, then kimi, then cursor"
   recall -r "yesterday's kimi session about the tycho dashboard being slow"
   recall agent "the fedi e2e run that kept timing out"
   recall agent -a codex -m gpt-5 "review of the miniapp api debugger"
+  recall deep "the session that opened https://github.com/fedibtc/fedi/pull/12279"
   recall -f codex -s 2026-09-01 hooks skills
   recall grep 'AGENTS\.md.*symlink' -f claude -n 5
   recall show a122183c
@@ -1425,7 +1469,7 @@ what gets indexed
   Cursor        ~/.cursor/chats/<workspace>/<id>/meta.json and prompt_history.json, tool paths from ~/.cursor/sessions/<id>.jsonl"#;
 
 const COMMANDS: &[&str] = &[
-    "agent", "search", "index", "grep", "show", "resume", "stats",
+    "agent", "deep", "search", "index", "grep", "show", "resume", "stats",
 ];
 
 fn parse_args() -> Args {
@@ -1436,7 +1480,7 @@ fn parse_args() -> Args {
         project: None,
         since: None,
         until: None,
-        limit: 10,
+        limit: None,
         json: false,
         all: false,
         full: false,
@@ -1445,6 +1489,7 @@ fn parse_args() -> Args {
         exclude: vec![],
         agent: std::env::var("RECALL_AGENT").unwrap_or_else(|_| "claude".into()),
         model: std::env::var("RECALL_MODEL").ok(),
+        model_flag: false,
         resume: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -1471,11 +1516,14 @@ fn parse_args() -> Args {
             "-p" | "--project" => a.project = Some(take(&mut i)),
             "-s" | "--since" => a.since = Some(take(&mut i)),
             "-u" | "--until" => a.until = Some(take(&mut i)),
-            "-n" | "--limit" => a.limit = take(&mut i).parse().unwrap_or(10),
+            "-n" | "--limit" => a.limit = take(&mut i).parse().ok(),
             "-T" | "--threads" => a.threads = take(&mut i).parse().ok(),
             "-x" | "--exclude" => a.exclude.push(take(&mut i)),
             "-a" | "--agent" => a.agent = take(&mut i),
-            "-m" | "--model" => a.model = Some(take(&mut i)),
+            "-m" | "--model" => {
+                a.model = Some(take(&mut i));
+                a.model_flag = true
+            }
             "-r" | "--resume" => a.resume = true,
             "-j" | "--json" => a.json = true,
             "-A" | "--all" => a.all = true,
@@ -1505,7 +1553,7 @@ fn parse_args() -> Args {
     let takes = match first {
         "show" | "resume" => Some(1),
         "index" | "stats" => Some(0),
-        "agent" | "search" | "grep" => None,
+        "agent" | "deep" | "search" | "grep" => None,
         _ => Some(usize::MAX),
     };
     let is_cmd = COMMANDS.contains(&first) && takes.map_or(true, |n| positional.len() - 1 <= n);
@@ -1520,7 +1568,7 @@ fn parse_args() -> Args {
         println!("{USAGE}");
         std::process::exit(2);
     }
-    if (a.cmd == "agent" || a.cmd == "search" || a.cmd == "grep") && a.args.is_empty() {
+    if matches!(a.cmd.as_str(), "agent" | "deep" | "search" | "grep") && a.args.is_empty() {
         println!("{USAGE}");
         std::process::exit(2);
     }
@@ -1617,8 +1665,8 @@ fn build_prompt(desc: &str, cands: &[Value]) -> String {
 Candidates, ranked by a deterministic keyword search over each session's user prompts. The rank is a strong prior: candidate [1] is the best keyword match. \
 Prefer a lower rank only when its prompts clearly show the user doing what the description says. Judge by what the user asked for in the prompts, not by the title, \
 which is auto-generated from the first prompt and often names only how the session started. The user may misremember dates and which tool they used.\n\n{body}\n\
-Pick the single candidate whose prompts best match what the user describes. If none plausibly matches, pick 0.\n\
-Reply with one line of JSON only, no prose: {{\"pick\": <number>, \"confidence\": \"high\"|\"medium\"|\"low\", \"why\": \"<one short sentence>\"}}",
+Rank up to three candidates whose prompts plausibly match what the user describes, best first. Use an empty list if none plausibly matches.\n\
+Reply with one line of JSON only, no prose: {{\"picks\": [<number>, ...], \"confidence\": \"high\"|\"medium\"|\"low\", \"why\": \"<one short sentence about the first pick>\"}}",
         today = date_ago(0), body = lines.join("\n")
     )
 }
@@ -1703,15 +1751,30 @@ fn ask(agent: &str, model: Option<&str>, prompt: &str) -> Result<String, String>
     }
 }
 
-fn parse_pick(raw: &str) -> (usize, String, String) {
-    let rx = Regex::new(r#"(?s)\{[^{}]*"pick"[^{}]*\}"#).unwrap();
-    if let Some(m) = rx.find(raw) {
-        if let Ok(o) = serde_json::from_str::<Value>(m.as_str()) {
-            let pick = o.get("pick").and_then(Value::as_u64).unwrap_or(0) as usize;
-            return (pick, s(&o, "confidence"), s(&o, "why"));
-        }
+fn parse_picks(raw: &str, n: usize) -> (Vec<usize>, String, String) {
+    let rx = Regex::new(r#"(?s)\{[^{}]*"picks?"[^{}]*\}"#).unwrap();
+    if let Some(o) = rx
+        .find(raw)
+        .and_then(|m| serde_json::from_str::<Value>(m.as_str()).ok())
+    {
+        let mut picks: Vec<usize> = match o.get("picks").and_then(Value::as_array) {
+            Some(xs) => xs
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|x| x as usize)
+                .collect(),
+            None => o
+                .get("pick")
+                .and_then(Value::as_u64)
+                .map(|x| vec![x as usize])
+                .unwrap_or_default(),
+        };
+        let mut seen = HashSet::new();
+        picks.retain(|p| (1..=n).contains(p) && seen.insert(*p));
+        picks.truncate(3);
+        return (picks, s(&o, "confidence"), s(&o, "why"));
     }
-    (0, "low".into(), "model gave no usable answer".into())
+    (vec![], "low".into(), "model gave no usable answer".into())
 }
 
 fn exec_resume(cmd: &str) -> ! {
@@ -1725,96 +1788,508 @@ fn exec_resume(cmd: &str) -> ! {
     std::process::exit(1)
 }
 
-fn cmd_agent(hits: &[Hit], desc: &str, a: &Args, search_secs: f64) {
+fn head_of(r: &Value) -> String {
+    let title = s(r, "title");
+    if title.is_empty() {
+        s(r, "first")
+    } else {
+        title
+    }
+}
+
+fn print_picks(picks: &[(&Value, String)]) {
+    for (i, (r, why)) in picks.iter().enumerate() {
+        println!(
+            "{:>2}. {:<6} {}  {:<22} {}",
+            i + 1,
+            s(r, "harness"),
+            take_chars(&s(r, "started"), 10),
+            one_line(&s(r, "project"), 22),
+            s(r, "id")
+        );
+        println!("      {}", one_line(&head_of(r), 110));
+        for (j, line) in wrap(why, 100).iter().enumerate() {
+            println!("      {}{line}", if j == 0 { "why: " } else { "     " });
+        }
+    }
+}
+
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = vec![];
+    let mut cur = String::new();
+    for w in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + w.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(w);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+struct AgentResult<'a> {
+    hits: Vec<Hit<'a>>,
+    picks: Vec<usize>,
+    confidence: String,
+    why: String,
+    search_secs: f64,
+    model_secs: f64,
+    model: String,
+}
+
+fn agent_search<'a>(subset: &[&'a Value], desc: &str, a: &Args) -> Result<AgentResult<'a>, String> {
+    let t = Instant::now();
+    let hits = search(subset, desc, a.limit.unwrap_or(10).max(10));
+    let search_secs = t.elapsed().as_secs_f64();
+    let model = a.model.clone().unwrap_or_else(|| match a.agent.as_str() {
+        "claude" => "sonnet".into(),
+        "local" => "qwen3.8:27b-mlx".into(),
+        _ => "default".into(),
+    });
     if hits.is_empty() {
-        println!("no candidate sessions matched the description");
-        std::process::exit(1);
+        return Ok(AgentResult {
+            hits,
+            picks: vec![],
+            confidence: "low".into(),
+            why: "no session shares a word with the description".into(),
+            search_secs,
+            model_secs: 0.0,
+            model,
+        });
+    }
+    if is_tty(2) {
+        eprintln!(
+            "agent search: {} {model} is reading the top {} prompt lists\n",
+            a.agent,
+            hits.len()
+        );
     }
     let cands: Vec<Value> = hits
         .iter()
         .map(|(score, matched, r)| hit_json(*score, matched, r))
         .collect();
-    let prompt = build_prompt(desc, &cands);
     let t = Instant::now();
-    let raw = match ask(&a.agent, a.model.as_deref(), &prompt) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1)
-        }
-    };
+    let raw = ask(&a.agent, a.model.as_deref(), &build_prompt(desc, &cands))?;
     let model_secs = t.elapsed().as_secs_f64();
-    let (pick, conf, why) = parse_pick(&raw);
-    let model_name = a.model.clone().unwrap_or_else(|| {
-        if a.agent == "claude" {
-            "sonnet".into()
-        } else if a.agent == "local" {
-            "qwen3.8:27b-mlx".into()
-        } else {
-            "default".into()
-        }
-    });
-    if a.json {
-        let picked = if (1..=cands.len()).contains(&pick) {
-            cands[pick - 1].clone()
-        } else {
-            Value::Null
-        };
+    let (picks, confidence, why) = parse_picks(&raw, hits.len());
+    Ok(AgentResult {
+        hits,
+        picks,
+        confidence,
+        why,
+        search_secs,
+        model_secs,
+        model,
+    })
+}
+
+fn agent_json(p: &AgentResult, a: &Args) -> Value {
+    let cands: Vec<Value> = p
+        .hits
+        .iter()
+        .map(|(score, matched, r)| hit_json(*score, matched, r))
+        .collect();
+    let picks: Vec<Value> = p.picks.iter().map(|&i| cands[i - 1].clone()).collect();
+    json!({"pick": picks.first().cloned().unwrap_or(Value::Null), "picks": picks, "confidence": p.confidence, "why": p.why, "candidates": cands,
+           "search_secs": round3(p.search_secs), "model_secs": round3(p.model_secs), "agent": a.agent, "model": p.model})
+}
+
+fn print_agent<'a>(p: &AgentResult<'a>, a: &Args, resume_line: bool) -> Vec<&'a Value> {
+    let shown: Vec<&'a Value> = p.picks.iter().map(|&i| p.hits[i - 1].2).collect();
+    if shown.is_empty() {
         println!(
-            "{}",
-            pretty(
-                &json!({"pick": picked, "confidence": conf, "why": why, "candidates": cands, "search_secs": round3(search_secs), "model_secs": round3(model_secs), "agent": a.agent, "model": model_name})
-            )
+            "no plausible match among the top {}: {}",
+            p.hits.len(),
+            p.why
         );
-        return;
-    }
-    if !(1..=cands.len()).contains(&pick) {
-        println!("no confident match ({why}). top candidates:\n");
-        for (i, c) in cands.iter().enumerate() {
-            let head = if s(c, "title").is_empty() {
-                s(c, "first")
-            } else {
-                s(c, "title")
-            };
-            println!(
-                "{:>2}. {:<6} {}  {:<18} {}  {}",
-                i + 1,
-                s(c, "harness"),
-                take_chars(&s(c, "started"), 10),
-                one_line(&s(c, "project"), 18),
-                take_chars(&s(c, "id"), 14),
-                one_line(&head, 70)
-            );
-        }
-        eprintln!(
-            "\nsearch {search_secs:.2}s  model {model_secs:.1}s ({} {model_name})",
-            a.agent
-        );
-        std::process::exit(1);
-    }
-    let c = &cands[pick - 1];
-    let head = if s(c, "title").is_empty() {
-        one_line(&s(c, "first"), 100)
     } else {
-        s(c, "title")
-    };
-    println!(
-        "{}  {}  {}  {}",
-        s(c, "harness"),
-        take_chars(&s(c, "started"), 10),
-        s(c, "project"),
-        s(c, "id")
-    );
-    println!("{head}");
-    println!("{conf}: {why}");
-    println!();
-    println!("{}", s(c, "resume"));
+        print_picks(
+            &shown
+                .iter()
+                .map(|r| (*r, String::new()))
+                .collect::<Vec<_>>(),
+        );
+        println!("\n{} confidence: {}", p.confidence, p.why);
+    }
     eprintln!(
-        "\nsearch {search_secs:.2}s  model {model_secs:.1}s ({} {model_name})",
-        a.agent
+        "search {:.2}s  model {:.1}s ({} {})",
+        p.search_secs, p.model_secs, a.agent, p.model
     );
-    if a.resume {
-        exec_resume(&s(c, "resume"));
+    if resume_line {
+        if let Some(r) = shown.first() {
+            println!("\nresume: {}", s(r, "resume"));
+        }
+    }
+    shown
+}
+
+// ---------------------------------------------------------------- deep search
+
+const DEEP_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(recall *)",
+    "Bash(grep *)",
+    "Bash(rg *)",
+    "Bash(jq *)",
+    "Bash(head *)",
+    "Bash(tail *)",
+    "Bash(wc *)",
+    "Bash(sort *)",
+    "Bash(uniq *)",
+    "Bash(cut *)",
+    "Bash(ls *)",
+    "Bash(gh pr view *)",
+    "Bash(gh pr list *)",
+    "Bash(gh issue view *)",
+    "Bash(gh search *)",
+];
+const DEEP_SCHEMA: &str = r#"{"type":"object","properties":{"picks":{"type":"array","maxItems":3,"items":{"type":"object","properties":{"id":{"type":"string"},"why":{"type":"string"}},"required":["id","why"]}},"confidence":{"type":"string","enum":["high","medium","low"]}},"required":["picks","confidence"]}"#;
+
+fn deep_prompt(desc: &str, a: &Args, seen: &[&Value]) -> String {
+    let mut notes: Vec<String> = vec![];
+    if !seen.is_empty() {
+        notes.push("The user already saw these sessions and is still looking. One of them may still be right, but look past them:".into());
+        for r in seen {
+            notes.push(format!(
+                "- {} {} {} {} | {}",
+                s(r, "id"),
+                s(r, "harness"),
+                take_chars(&s(r, "started"), 10),
+                s(r, "project"),
+                one_line(&head_of(r), 80)
+            ));
+        }
+    }
+    if !a.exclude.is_empty() {
+        notes.push(format!(
+            "Never pick a session whose id starts with {}.",
+            a.exclude.join(" or ")
+        ));
+    }
+    if let Some(h) = &a.harness {
+        notes.push(format!("Only {h} sessions."));
+    }
+    if let Some(p) = &a.project {
+        notes.push(format!(
+            "Only sessions whose working directory contains \"{p}\"."
+        ));
+    }
+    if let Some(d) = &a.since {
+        notes.push(format!("Only sessions that ended on or after {d}."));
+    }
+    if let Some(d) = &a.until {
+        notes.push(format!("Only sessions that started on or before {d}."));
+    }
+    format!(
+        r#"Today is {today}. Find one past coding-agent session on this machine. The user describes it from memory:
+
+"""{desc}"""
+
+{notes}
+
+Transcripts are read in place:
+- Claude Code: ~/.claude/projects/<slug>/<id>.jsonl
+- Codex: ~/.codex/sessions/Y/M/D/rollout-*-<id>.jsonl
+- Kimi Code: ~/.kimi-code/sessions/wd_*/session_<id>/agents/main/wire.jsonl
+- Cursor: ~/.cursor/chats/<workspace>/<id>/ and ~/.cursor/sessions/<id>.jsonl
+A transcript can be tens of megabytes. Search it, never read it whole.
+
+Commands you can run:
+- recall "<words>" -n 20 -j    ranks sessions by the words the user typed, plus titles and touched paths
+- recall grep '<regex>' -n 20  ranks sessions by regex hits in the raw transcripts, including agent replies and tool output
+- recall show <id>             every prompt the user typed in one session, with its directory, dates and transcript path
+- grep, rg, jq, head, tail, wc, sort, uniq, cut and ls on transcript files
+- gh pr view, gh pr list, gh issue view and gh search for GitHub facts
+
+The recall index holds only what the user typed. Anything an agent produced, like a PR or issue number, a branch, a commit, a file name or an error message, is only in the raw transcripts, so use recall grep for it. For a PR, gh pr view <number> --repo <owner/repo> --json headRefName,createdAt,title gives the branch and date to search for. The session that opened a PR ran gh pr create and printed its URL. A session where the user pasted the link while searching for it is not the one that made it.
+
+Check each answer against its transcript before you give it. Return up to three session ids, best first, each with one sentence of evidence from the transcript. Return an empty list if nothing matches."#,
+        today = date_ago(0),
+        notes = notes.join("\n")
+    )
+}
+
+struct DeepResult<'a> {
+    picks: Vec<(&'a Value, String)>,
+    confidence: String,
+    secs: f64,
+    model: String,
+}
+
+fn deep_search<'a>(
+    recs: &'a [Value],
+    desc: &str,
+    a: &Args,
+    seen: &[&Value],
+) -> Result<DeepResult<'a>, String> {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let model = match (&a.model, a.cmd == "deep" && a.model_flag) {
+        (Some(m), true) => m.clone(),
+        _ => std::env::var("RECALL_DEEP_MODEL").unwrap_or_else(|_| "opus".into()),
+    };
+    let progress = is_tty(2);
+    if progress {
+        eprintln!("deep search: claude {model} is searching the raw transcripts. Ctrl-C stops it.");
+    }
+    let t = Instant::now();
+    let mut child = Command::new("claude")
+        .current_dir(home())
+        .env("RECALL_DEPTH", "1")
+        .args([
+            "-p",
+            &deep_prompt(desc, a, seen),
+            "--model",
+            &model,
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+            "--setting-sources",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--json-schema",
+            DEEP_SCHEMA,
+            "--allowedTools",
+        ])
+        .args(DEEP_TOOLS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("claude: {e}"))?;
+    let home_s = home().to_string_lossy().into_owned();
+    let mut out: Option<Value> = None;
+    let mut failure = String::new();
+    for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+        let Ok(line) = line else { break };
+        let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match ev.get("type").and_then(Value::as_str) {
+            Some("assistant") if progress => {
+                for c in ev
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if c.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    let input = c.get("input").cloned().unwrap_or(Value::Null);
+                    let step = match s(c, "name").as_str() {
+                        "Bash" => s(&input, "command"),
+                        "Read" => format!("read {}", s(&input, "file_path")),
+                        "Grep" => format!("grep {} {}", s(&input, "pattern"), s(&input, "path")),
+                        "Glob" => format!("glob {}", s(&input, "pattern")),
+                        "StructuredOutput" => continue,
+                        other => other.to_string(),
+                    };
+                    eprintln!("  · {}", one_line(&step.replace(&home_s, "~"), 110));
+                }
+            }
+            Some("result") => {
+                out = ev
+                    .get("structured_output")
+                    .cloned()
+                    .filter(Value::is_object);
+                failure = one_line(&s(&ev, "result"), 300);
+            }
+            _ => {}
+        }
+    }
+    child.wait().ok();
+    if progress {
+        eprintln!();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    let out = out.ok_or_else(|| format!("deep search ended without an answer. {failure}"))?;
+    let mut picks: Vec<(&'a Value, String)> = vec![];
+    for p in out
+        .get("picks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = s(p, "id");
+        let found: Vec<&'a Value> = recs
+            .iter()
+            .filter(|r| {
+                let rid = s(r, "id");
+                !id.is_empty() && (rid.starts_with(&id) || rid.ends_with(&id))
+            })
+            .collect();
+        let ids: HashSet<String> = found.iter().map(|r| s(r, "id")).collect();
+        if ids.len() != 1 {
+            eprintln!("deep search named {id}, which is not one session in the index");
+            continue;
+        }
+        let r = *found.iter().max_by_key(|r| s(r, "ended")).unwrap();
+        let rid = s(r, "id");
+        if a.exclude.iter().any(|x| rid.starts_with(x.as_str()))
+            || picks.iter().any(|(q, _)| s(q, "id") == rid)
+        {
+            continue;
+        }
+        picks.push((r, s(p, "why")));
+    }
+    Ok(DeepResult {
+        picks,
+        confidence: s(&out, "confidence"),
+        secs,
+        model,
+    })
+}
+
+fn deep_json(p: &DeepResult) -> Value {
+    let picks: Vec<Value> = p
+        .picks
+        .iter()
+        .map(|(r, why)| {
+            let mut h = hit_json(0.0, &[], r);
+            h["why"] = json!(why);
+            h
+        })
+        .collect();
+    json!({"picks": picks, "confidence": p.confidence, "secs": round3(p.secs), "model": p.model})
+}
+
+fn print_deep<'a>(p: &DeepResult<'a>, resume_line: bool) -> Vec<&'a Value> {
+    if p.picks.is_empty() {
+        println!("deep search found no matching session");
+    } else {
+        print_picks(&p.picks);
+        println!("\n{} confidence", p.confidence);
+    }
+    eprintln!("deep search {:.0}s (claude {})", p.secs, p.model);
+    let shown: Vec<&'a Value> = p.picks.iter().map(|(r, _)| *r).collect();
+    if resume_line {
+        if let Some(r) = shown.first() {
+            println!("\nresume: {}", s(r, "resume"));
+        }
+    }
+    shown
+}
+
+// ---------------------------------------------------------------- follow-up keys
+
+fn is_tty(fd: i32) -> bool {
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+fn read_key(discard_typeahead: bool) -> Option<u8> {
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
+        return None;
+    }
+    let mut raw = saved;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    let mut b = [0u8; 1];
+    let n = unsafe {
+        libc::tcsetattr(0, libc::TCSANOW, &raw);
+        if discard_typeahead {
+            libc::tcflush(0, libc::TCIFLUSH);
+        }
+        let n = libc::read(0, b.as_mut_ptr() as *mut libc::c_void, 1);
+        libc::tcsetattr(0, libc::TCSANOW, &saved);
+        n
+    };
+    if n == 1 {
+        Some(b[0])
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    Quick,
+    Grep,
+    Agent,
+    Deep,
+}
+
+fn follow_up<'a>(
+    recs: &'a [Value],
+    subset: &[&'a Value],
+    desc: &str,
+    a: &Args,
+    mut stage: Stage,
+    mut shown: Vec<&'a Value>,
+) -> ! {
+    use std::io::Write;
+    let mut seen: Vec<&'a Value> = shown.clone();
+    loop {
+        let n = shown.len().min(9);
+        let can_agent = stage == Stage::Quick;
+        let can_deep = matches!(stage, Stage::Quick | Stage::Agent);
+        let mut keys: Vec<String> = vec![];
+        if n == 1 {
+            keys.push("1 resume".into());
+        }
+        if n > 1 {
+            keys.push(format!("1-{n} resume"));
+        }
+        if can_agent {
+            keys.push("a agent search".into());
+        }
+        if can_deep {
+            keys.push("d deep search".into());
+        }
+        keys.push("q quit".into());
+        print!("\n{} ", keys.join("   "));
+        std::io::stdout().flush().ok();
+        let mut first = true;
+        let key = loop {
+            let k = read_key(first);
+            first = false;
+            match k {
+                Some(k @ b'1'..=b'9') if ((k - b'1') as usize) < n => break k,
+                Some(b'a' | b'A') if can_agent => break b'a',
+                Some(b'd' | b'D') if can_deep => break b'd',
+                Some(b'q' | b'Q' | 27 | b'\r' | b'\n' | 3 | 4) | None => break b'q',
+                _ => {}
+            }
+        };
+        print!("\r\x1b[2K");
+        std::io::stdout().flush().ok();
+        match key {
+            b'1'..=b'9' => exec_resume(&s(shown[(key - b'1') as usize], "resume")),
+            b'a' => match agent_search(subset, desc, a) {
+                Ok(p) => {
+                    shown = print_agent(&p, a, false);
+                    stage = Stage::Agent;
+                }
+                Err(e) => eprintln!("agent search failed: {e}"),
+            },
+            b'd' => match deep_search(recs, desc, a, &seen) {
+                Ok(p) => {
+                    shown = print_deep(&p, false);
+                    stage = Stage::Deep;
+                }
+                Err(e) => eprintln!("deep search failed: {e}"),
+            },
+            _ => std::process::exit(0),
+        }
+        for r in &shown {
+            if !seen.iter().any(|x| s(x, "id") == s(r, "id")) {
+                seen.push(r);
+            }
+        }
     }
 }
 
@@ -1838,8 +2313,8 @@ fn main() {
         build_index(a.full, true);
         return;
     }
-    let t0 = Instant::now();
-    let quiet = a.json || a.cmd == "agent" || a.cmd == "resume";
+    let interactive = !a.json && !a.resume && is_tty(0) && is_tty(1);
+    let quiet = a.json || interactive || matches!(a.cmd.as_str(), "agent" | "deep" | "resume");
     let recs = if a.no_refresh && index_file().exists() {
         load_index()
     } else {
@@ -1873,22 +2348,64 @@ fn main() {
             if a.cmd != "grep" && a.since.is_none() {
                 a.since = date_window(&query);
             }
-            let subset = filter_recs(&recs, &a);
-            let results = if a.cmd == "grep" {
-                grep_sessions(&subset, &query, &a)
-            } else {
-                search(&subset, &query, &a)
-            };
-            let search_secs = t0.elapsed().as_secs_f64();
-            if a.cmd == "agent" {
-                cmd_agent(&results, &query, &a, search_secs);
-                return;
+            if matches!(a.cmd.as_str(), "agent" | "deep")
+                && std::env::var_os("RECALL_DEPTH").is_some()
+            {
+                eprintln!("recall {} is off inside a deep search", a.cmd);
+                std::process::exit(2);
             }
-            print_results(&results, a.json);
-            if a.resume {
-                if let Some(first) = results.first() {
-                    exec_resume(&s(first.2, "resume"));
+            let subset = filter_recs(&recs, &a);
+            let (stage, shown): (Stage, Vec<&Value>) = match a.cmd.as_str() {
+                "agent" => {
+                    let p = agent_search(&subset, &query, &a).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1)
+                    });
+                    if a.json {
+                        println!("{}", pretty(&agent_json(&p, &a)));
+                        return;
+                    }
+                    (Stage::Agent, print_agent(&p, &a, !interactive))
                 }
+                "deep" => {
+                    let p = deep_search(&recs, &query, &a, &[]).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1)
+                    });
+                    if a.json {
+                        println!("{}", pretty(&deep_json(&p)));
+                        return;
+                    }
+                    (Stage::Deep, print_deep(&p, !interactive))
+                }
+                cmd => {
+                    let limit = a.limit.unwrap_or(if !a.json && is_tty(1) { 3 } else { 10 });
+                    let results = if cmd == "grep" {
+                        grep_sessions(&subset, &query, limit)
+                    } else {
+                        search(&subset, &query, limit)
+                    };
+                    print_results(&results, a.json, !interactive);
+                    (
+                        if cmd == "grep" {
+                            Stage::Grep
+                        } else {
+                            Stage::Quick
+                        },
+                        results.iter().map(|h| h.2).collect(),
+                    )
+                }
+            };
+            if a.resume {
+                if let Some(first) = shown.first() {
+                    exec_resume(&s(first, "resume"));
+                }
+            }
+            if interactive {
+                follow_up(&recs, &subset, &query, &a, stage, shown);
+            }
+            if shown.is_empty() && matches!(stage, Stage::Agent | Stage::Deep) {
+                std::process::exit(1);
             }
         }
     }

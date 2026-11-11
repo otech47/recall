@@ -12,9 +12,12 @@ recall "the one where I made my claude skills and hooks work in codex, then kimi
       > So, I want to try out a new LLM subscription using the open source models...
       terms: agent claude codex cursor harness hook kimi skill   turns: 13
  2. ...
+ 3. ...
 
-resume: cd /Users/you/tools && claude --resume a122183c-3aed-48c9-a384-c57502e60429
+1-3 resume   a agent search   d deep search   q quit
 ```
+
+Press a number to reopen that session in the same window. If the right one is not there, press `a` and a model rereads the top ten. If that misses too, press `d` and claude searches the raw transcripts itself.
 
 ## How it works
 
@@ -23,20 +26,23 @@ resume: cd /Users/you/tools && claude --resume a122183c-3aed-48c9-a384-c57502e60
   <img alt="your words go into a deterministic index and ranking over every transcript on disk, then an optional model call picks, and out comes the session id and its resume command" src="docs/how-it-works-light.png" width="780">
 </picture>
 
-Everything left of the model call is deterministic and runs in well under a second. The model call is optional and is the only step that takes seconds.
+Everything left of the model call is deterministic and runs in well under a second. Agent search adds one model call of a few seconds. Deep search runs a claude session over the raw transcripts and usually takes under a minute.
 
 1. **index.** Every transcript on disk is read once into one record per session: its user prompts, title, project, branch, dates and the file paths the agent touched. Injected system text, tool results and hook output are stripped. Later runs reparse only files whose size or mtime changed.
 2. **rank.** Your words are matched against every record. Rare words count more than common ones, a hit in the title or project name counts more than a hit in a late prompt, plurals and -ed/-ing are folded, and recent sessions get a small boost. Same words, same index, same answer every time.
-3. **pick, only with `recall agent`.** The top ten records go to a model along with each one's prompt list, in one call. The model reads what you asked for in each session and returns one number. It sees the prompts, not the titles, because a title comes from the first prompt and often names only how a session started.
-4. **resume.** The output is the harness, date, project, id and the exact command that reopens the session. `-r` runs that command.
+3. **pick, only with agent search.** The top ten records go to a model along with each one's prompt list, in one call. The model reads what you asked for in each session and ranks up to three. It sees the prompts, not the titles, because a title comes from the first prompt and often names only how a session started.
+4. **dig, only with deep search.** The index holds only what you typed, so a PR number or branch that an agent created is invisible to steps 2 and 3. Deep search runs claude with read-only tools over the raw transcripts. It looks things up on GitHub, greps for what the agent produced, and checks each answer in its transcript before it returns up to three. It is told which sessions you already saw.
+5. **resume.** In a terminal, a number key reopens that session in the same window. Piped or with `-j`, the output ends with the command that reopens the first result. `-r` runs it without asking.
 
 ## Usage
 
 ```
-recall "<what you remember>"           rank only, no model call
-recall agent "<what you remember>"     rank, then one model call picks. claude sonnet by default
-recall agent -a codex -m gpt-5 "..."   another agent and model do the picking
-recall -r "..."                        run the resume command of the pick or first hit
+recall "<what you remember>"           rank only, no model call. Three results and a key prompt in a terminal
+recall <session-id>                    find that exact session
+recall agent "<what you remember>"     rank, then one model call ranks up to three. claude sonnet by default
+recall agent -a codex -m gpt-5 "..."   another agent and model do the ranking
+recall deep "<what you remember>"      claude searches the raw transcripts and checks its answers. opus by default
+recall -r "..."                        reopen the first result without asking
 
 recall show <id>                       one session in full: prompts, paths, transcript file, resume command
 recall resume <id>                     print the resume command
@@ -47,18 +53,31 @@ recall stats                           sessions per harness, index location
 
 Every option has a short and a long form. `recall -h` prints the full help.
 
+In a terminal, every result list waits for one key:
+
+| key | what it does |
+|---|---|
+| `1` to `3` | reopen that session here, in its own directory |
+| `a` | agent search on the same words, after a plain search |
+| `d` | deep search on the same words, after a plain or agent search |
+| `q`, Enter, Esc | quit |
+
+Piped output and `-j` never wait for a key, so scripts and agents get plain text or JSON.
+
+A full session ID selects that session before text ranking. Search filters and exclusions still apply. Use `recall show <id-prefix>` for a shortened ID, and `recall grep '<words>'` for words from the agent's reply.
+
 | option | what it does |
 |---|---|
-| `-r`, `--resume` | run the resume command instead of printing it |
-| `-a`, `--agent` | who picks in agent mode: `claude`, `codex`, `kimi`, `cursor`, `local` (ollama) |
-| `-m`, `--model` | model for that agent, passed through as is |
-| `-n`, `--limit` | how many hits to print, or how many candidates the model sees |
+| `-r`, `--resume` | reopen the first result instead of waiting for a key |
+| `-a`, `--agent` | who ranks in agent search: `claude`, `codex`, `kimi`, `cursor`, `local` (ollama). Deep search always runs on claude |
+| `-m`, `--model` | model for agent search, or for deep search with `recall deep`, passed through as is |
+| `-n`, `--limit` | how many results to print. 3 in a terminal, 10 when piped or with `-j` |
 | `-f`, `--from` | only sessions from one harness |
 | `-p`, `--project` | only sessions whose project directory or path contains this |
 | `-s`, `--since`, `-u`, `--until` | date window, `YYYY-MM-DD`. Phrases like "last week" or "a few weeks ago" set one on their own |
 | `-x`, `--exclude` | drop a session id prefix. An agent should pass its own session id |
 | `-j`, `--json` | machine output |
-| `-A`, `--all` | include background sessions and sessions with no user prompt |
+| `-A`, `--all` | include sessions with no user prompt |
 
 ## Install
 
@@ -71,7 +90,16 @@ cargo build --release
 ln -s "$PWD/target/release/recall" ~/.local/bin/recall
 ```
 
-The index lives at `~/.agents/recall/index.jsonl`. `RECALL_INDEX_DIR` moves it, `RECALL_AGENT` and `RECALL_MODEL` set the defaults for agent mode.
+The index lives at `~/.agents/recall/index.jsonl`. `RECALL_INDEX_DIR` moves it, `RECALL_AGENT` and `RECALL_MODEL` set the defaults for agent search, and `RECALL_DEEP_MODEL` sets the model for deep search.
+
+## Tests
+
+Run the search regressions against the release binary with Python's standard library:
+
+```
+cargo build --release
+python3 tests/search.py
+```
 
 ## For agents
 
@@ -87,6 +115,8 @@ The index lives at `~/.agents/recall/index.jsonl`. `RECALL_INDEX_DIR` moves it, 
 | Kimi Code | `~/.kimi-code/sessions/wd_*/session_*/agents/main/wire.jsonl` plus `state.json` | `kimi --session <id>` |
 | Cursor | `~/.cursor/chats/<workspace>/<id>/meta.json` and `prompt_history.json`, tool paths from `~/.cursor/sessions/<id>.jsonl` | `agent --resume <id>` |
 
+Sessions in a workspace with `flake.nix` resume through `nix develop`, including sessions started in subdirectories. Fedi worktrees use the `worktree` shell.
+
 Transcripts are read in place and never modified.
 
 </details>
@@ -94,7 +124,7 @@ Transcripts are read in place and never modified.
 <details>
 <summary>the ranking, exactly</summary>
 
-Terms are lowercased, stopwords dropped, and stemmed with Porter steps 1a and 1b only. For each session, score is the sum over matched terms of idf times a field weight times log(1 + count), where the weights are title 4, project 3, first prompt 2.5, branch 2, compaction summary 1.5, touched paths 1.5, later prompts 1. The sum is scaled by the fraction of query terms present and by a 15 percent boost that decays over 90 days.
+Terms are lowercased, stopwords dropped, and stemmed with Porter steps 1a and 1b only. The scheme and host of a link are dropped first, so a pasted GitHub link is matched on its owner, repo and number. A term's rarity is the square of its BM25 idf, so a PR number that three sessions mention outweighs words that a third of all sessions share. For each session, score is the sum over matched terms of rarity times a field weight times log(1 + count), where the weights are title 4, project 3, first prompt 2.5, branch 2, compaction summary 1.5, touched paths 1.5, later prompts 1. The sum is scaled by the share of the query's total rarity that the session matched and by a 15 percent boost that decays over 90 days.
 
 </details>
 

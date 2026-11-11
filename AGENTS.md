@@ -48,7 +48,7 @@ Search the raw transcripts when the words you have are from the agent's output r
 recall grep '<regex>' -f claude -n 5
 ```
 
-Agent mode, which spends one model call on the pick, is for the human at the terminal (`recall agent "..."`). You are already a model. Run the plain search and judge the prompt lists yourself.
+Agent search and deep search spend model calls for the human at the terminal (`recall agent "..."`, `recall deep "..."`). You are already a model. Run the plain search, use `recall grep` for anything an agent produced, and judge the results yourself.
 
 ## Report
 
