@@ -764,17 +764,121 @@ fn name_matches(p: &Path, prefix: &str, suffix: &str) -> bool {
     n.starts_with(prefix) && n.ends_with(suffix)
 }
 
-fn discover() -> Vec<(&'static str, PathBuf)> {
+fn archive_dir() -> PathBuf {
+    std::env::var("RECALL_ARCHIVE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".agent-archive"))
+}
+
+/// The session stores to read: this Mac's live stores, then each Mac's copy under
+/// ~/.agent-archive/<mac>/{claude,codex,kimi}, which the Studio's hub fills.
+fn store_roots() -> Vec<(String, PathBuf, PathBuf, PathBuf)> {
     let h = home();
+    let mut roots = vec![(
+        String::new(),
+        h.join(".claude").join("projects"),
+        h.join(".codex").join("sessions"),
+        h.join(".kimi-code").join("sessions"),
+    )];
+    for mac in list_dir(&archive_dir()) {
+        if mac.is_dir() {
+            let name = mac
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            roots.push((
+                name,
+                mac.join("claude"),
+                mac.join("codex"),
+                mac.join("kimi"),
+            ));
+        }
+    }
+    roots
+}
+
+/// Where a session file came from: the archived Mac's name (empty for this Mac's live
+/// stores) and its path inside its store, which is the same for every copy of one session.
+fn origin(
+    harness: &str,
+    path: &str,
+    roots: &[(String, PathBuf, PathBuf, PathBuf)],
+) -> (String, String) {
+    let p = Path::new(path);
+    for (mac, claude, codex, kimi) in roots {
+        let root = match harness {
+            "claude" => claude,
+            "codex" => codex,
+            "kimi" => kimi,
+            _ => continue,
+        };
+        if let Ok(rel) = p.strip_prefix(root) {
+            return (mac.clone(), rel.to_string_lossy().into_owned());
+        }
+    }
+    (String::new(), path.to_string())
+}
+
+/// One record per session file. A copy in this Mac's live store wins, then the newest copy.
+/// Archived records name their Mac and point at the transcript instead of a resume command,
+/// because a session is never resumed on a Mac it did not run on.
+fn dedup(recs: Vec<Value>) -> Vec<Value> {
+    let mut best: HashMap<(String, String), (bool, f64, usize)> = HashMap::new();
+    let mut tagged = vec![];
+    let roots = store_roots();
+    for (i, mut r) in recs.into_iter().enumerate() {
+        let harness = s(&r, "harness");
+        let (mac, rel) = origin(&harness, &s(&r, "path"), &roots);
+        let live = mac.is_empty();
+        let mt = r.get("mtime").and_then(Value::as_f64).unwrap_or(0.0);
+        if !live {
+            r["mac"] = Value::String(mac.clone());
+            r["resume"] = Value::String(format!(
+                "# archived from {mac}: read {} and start a new session",
+                shell_quote(&s(&r, "path"))
+            ));
+        }
+        // a record with no transcript path has nothing to match against
+        let key = if rel.is_empty() {
+            (harness, format!("#{i}"))
+        } else {
+            (harness, rel)
+        };
+        let better = match best.get(&key) {
+            None => true,
+            Some(&(l, m, _)) => (live && !l) || (live == l && mt > m),
+        };
+        if better {
+            best.insert(key, (live, mt, i));
+        }
+        tagged.push(r);
+    }
+    let keep: std::collections::HashSet<usize> = best.values().map(|v| v.2).collect();
+    tagged
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, r)| r)
+        .collect()
+}
+
+fn discover() -> Vec<(&'static str, PathBuf)> {
     let mut out = vec![];
-    for proj in list_dir(&h.join(".claude").join("projects")) {
+    for (_, claude, codex, kimi) in store_roots() {
+        discover_root(&mut out, &claude, &codex, &kimi);
+    }
+    out
+}
+
+fn discover_root(out: &mut Vec<(&'static str, PathBuf)>, claude: &Path, codex: &Path, kimi: &Path) {
+    for proj in list_dir(claude) {
         for f in list_dir(&proj) {
             if f.is_file() && name_matches(&f, "", ".jsonl") && !name_matches(&f, "agent-", "") {
                 out.push(("claude", f));
             }
         }
     }
-    for y in list_dir(&h.join(".codex").join("sessions")) {
+    for y in list_dir(codex) {
         for m in list_dir(&y) {
             for d in list_dir(&m) {
                 for f in list_dir(&d) {
@@ -785,7 +889,7 @@ fn discover() -> Vec<(&'static str, PathBuf)> {
             }
         }
     }
-    for wd in list_dir(&h.join(".kimi-code").join("sessions")) {
+    for wd in list_dir(kimi) {
         if !name_matches(&wd, "wd_", "") {
             continue;
         }
@@ -795,7 +899,6 @@ fn discover() -> Vec<(&'static str, PathBuf)> {
             }
         }
     }
-    out
 }
 
 fn fingerprint(harness: &str, p: &Path) -> (String, f64, u64) {
@@ -1193,8 +1296,8 @@ fn round3(x: f64) -> f64 {
 fn hit_json(score: f64, matched: &[String], r: &Value) -> Value {
     let mut d = Map::new();
     for k in [
-        "harness", "id", "project", "cwd", "branch", "started", "ended", "title", "turns", "kind",
-        "resume",
+        "harness", "id", "mac", "project", "cwd", "branch", "started", "ended", "title", "turns",
+        "kind", "resume",
     ] {
         d.insert(k.to_string(), r.get(k).cloned().unwrap_or(Value::Null));
     }
@@ -1397,7 +1500,8 @@ examples
 what gets indexed
   Claude Code   ~/.claude/projects/<slug>/<id>.jsonl, subagent agent-*.jsonl files skipped
   Codex         ~/.codex/sessions/Y/M/D/rollout-*.jsonl, only threads a user started, names from session_index.jsonl
-  Kimi Code     ~/.kimi-code/sessions/wd_*/session_*/agents/main/wire.jsonl plus state.json"#;
+  Kimi Code     ~/.kimi-code/sessions/wd_*/session_*/agents/main/wire.jsonl plus state.json
+  Archive       ~/.agent-archive/<mac>/{claude,codex,kimi}/, same layouts; a session found twice is listed once, live copy first"#;
 
 const COMMANDS: &[&str] = &[
     "agent", "deep", "search", "index", "grep", "show", "resume", "stats",
@@ -1714,6 +1818,10 @@ fn parse_picks(raw: &str, n: usize) -> (Vec<usize>, String, String) {
 
 fn exec_resume(cmd: &str) -> ! {
     use std::os::unix::process::CommandExt;
+    if cmd.starts_with('#') {
+        eprintln!("{}", cmd.trim_start_matches("# "));
+        std::process::exit(1)
+    }
     eprintln!("resuming: {cmd}");
     let e = std::process::Command::new("bash")
         .arg("-lc")
@@ -2249,11 +2357,11 @@ fn main() {
     }
     let interactive = !a.json && !a.resume && is_tty(0) && is_tty(1);
     let quiet = a.json || interactive || matches!(a.cmd.as_str(), "agent" | "deep" | "resume");
-    let recs = if a.no_refresh && index_file().exists() {
+    let recs = dedup(if a.no_refresh && index_file().exists() {
         load_index()
     } else {
         build_index(false, !quiet)
-    };
+    });
     match a.cmd.as_str() {
         "stats" => {
             let mut by: Map<String, Value> = Map::new();

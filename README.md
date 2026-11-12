@@ -118,6 +118,8 @@ Sessions in a workspace with `flake.nix` resume through `nix develop`, including
 
 Transcripts are read in place and never modified.
 
+recall also reads each Mac's copy under `~/.agent-archive/<mac>/{claude,codex,kimi}/`, with the same layout as the live stores. A session file found in more than one store is listed once: the live copy wins, then the newest. An archived hit names its Mac in `mac` and, in place of a resume command, says to read the transcript and start a new session. `RECALL_ARCHIVE_DIR` moves the archive root.
+
 </details>
 
 <details>

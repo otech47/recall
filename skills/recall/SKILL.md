@@ -31,6 +31,8 @@ recall "<the user's description, verbatim>" -x <your own session id> -j
 - Narrow with `-f <harness>`, `-p <project>`, `-s <since>`, `-u <until>`, `-n <count>` when the user gives you a handle.
 - `recall show <id>` prints one session in full. `recall grep '<regex>'` scans the raw transcripts when the words come from agent output rather than user prompts.
 
+On Oscar's Macs, run recall on the Mac Studio, oz-ms. It holds every Mac's sessions under `~/.agent-archive/<mac>/`, and recall reads those too. A hit with a `mac` field ran on that Mac. Never resume it here: read the transcript its `resume` line names and start a new session that carries on from it.
+
 Do not use `recall agent` or `recall deep`. They spend model calls for a human at the terminal. You are the model here.
 
 ## Answer

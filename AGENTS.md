@@ -22,6 +22,8 @@ Ranking only, no model call. This is the default and the fastest:
 recall "<the user's description, verbatim>" -x <your own session id> -j
 ```
 
+recall also reads `~/.agent-archive/<mac>/{claude,codex,kimi}/`, where a hub host keeps other Macs' sessions. A hit with a `mac` field ran on that Mac. Its `resume` line says to read the transcript and start a new session, because a session is never resumed on another Mac.
+
 Always pass `-x` with your own session id. The session asking the question contains the description and would otherwise match itself. Pass `-j` when you are going to read the result. It gives one object per hit with id, harness, project, dates, title, score, matched terms, first prompt and up to 15 prompts.
 
 Read the prompt lists, not the titles. A title comes from the first prompt and often names only how a session started. If the top hit's prompts do not match what the user described, look at the next few before answering.
