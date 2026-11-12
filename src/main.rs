@@ -770,8 +770,6 @@ fn archive_dir() -> PathBuf {
         .unwrap_or_else(|_| home().join(".agent-archive"))
 }
 
-/// The session stores to read: this Mac's live stores, then each Mac's copy under
-/// ~/.agent-archive/<mac>/{claude,codex,kimi}, which the Studio's hub fills.
 fn store_roots() -> Vec<(String, PathBuf, PathBuf, PathBuf)> {
     let h = home();
     let mut roots = vec![(
@@ -797,8 +795,7 @@ fn store_roots() -> Vec<(String, PathBuf, PathBuf, PathBuf)> {
     roots
 }
 
-/// Where a session file came from: the archived Mac's name (empty for this Mac's live
-/// stores) and its path inside its store, which is the same for every copy of one session.
+/// The Mac name is empty for a live store; the path is the same for every copy of a session.
 fn origin(
     harness: &str,
     path: &str,
@@ -819,9 +816,8 @@ fn origin(
     (String::new(), path.to_string())
 }
 
-/// One record per session file. A copy in this Mac's live store wins, then the newest copy.
-/// Archived records name their Mac and point at the transcript instead of a resume command,
-/// because a session is never resumed on a Mac it did not run on.
+/// An archived record gets no resume command: a session is never resumed on a Mac it did
+/// not run on.
 fn dedup(recs: Vec<Value>) -> Vec<Value> {
     let mut best: HashMap<(String, String), (bool, f64, usize)> = HashMap::new();
     let mut tagged = vec![];
@@ -838,7 +834,7 @@ fn dedup(recs: Vec<Value>) -> Vec<Value> {
                 shell_quote(&s(&r, "path"))
             ));
         }
-        // a record with no transcript path has nothing to match against
+        // records without a path are never copies of each other
         let key = if rel.is_empty() {
             (harness, format!("#{i}"))
         } else {
